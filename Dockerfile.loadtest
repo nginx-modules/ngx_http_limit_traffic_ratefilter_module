@@ -1,0 +1,110 @@
+# Dockerfile.loadtest
+#
+# Build:  docker build -f Dockerfile.loadtest -t ngx-rate-test .
+# Run:    docker run --rm ngx-rate-test
+# Shell:  docker run --rm -it ngx-rate-test bash
+#
+# Two targets:
+#   test-static  — module compiled into the binary (--add-module)
+#   test-dynamic — module compiled as a .so file  (--add-dynamic-module)
+#
+# Build a specific target:
+#   docker build -f Dockerfile.loadtest --target test-static  -t ngx-rate-test-static .
+#   docker build -f Dockerfile.loadtest --target test-dynamic -t ngx-rate-test .
+
+FROM debian:trixie AS base
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update -q && apt-get install -y -q \
+    build-essential  \
+    coreutils        \
+    tini             \
+    libpcre2-dev     \
+    zlib1g-dev       \
+    libssl-dev       \
+    netcat-openbsd   \
+    wget             \
+    curl             \
+    bc               \
+    procps           \
+    python3          \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG NGINX_VERSION=1.28.2
+WORKDIR /build
+RUN wget -q "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz" \
+    && tar xzf "nginx-${NGINX_VERSION}.tar.gz" \
+    && rm  "nginx-${NGINX_VERSION}.tar.gz"
+
+WORKDIR /module
+COPY config ./
+COPY ngx_http_limit_traffic_rate_filter_module.c ./
+
+
+FROM base AS nginx-static
+
+ARG NGINX_VERSION=1.28.2
+RUN cd /build/nginx-${NGINX_VERSION} && \
+    ./configure \
+        --with-debug \
+        --add-module=/module \
+        --prefix=/usr/local/nginx-static \
+        --with-http_stub_status_module \
+    && make -j"$(nproc)" \
+    && make install
+
+RUN /usr/local/nginx-static/sbin/nginx -V 2>&1 \
+    | grep -q "add-module=/module" \
+    || { echo "ERROR: module not found in static nginx -V"; exit 1; }
+
+
+FROM base AS nginx-dynamic
+
+ARG NGINX_VERSION=1.28.2
+RUN cd /build/nginx-${NGINX_VERSION} && \
+    ./configure \
+        --with-debug \
+        --add-dynamic-module=/module \
+        --prefix=/usr/local/nginx-dynamic \
+        --with-http_stub_status_module \
+    && make -j"$(nproc)" \
+    && make install
+
+RUN ls /usr/local/nginx-dynamic/modules/ \
+    | grep -q "ngx_http_limit_traffic_rate_filter_module.so" \
+    || { echo "ERROR: .so not found after dynamic build"; exit 1; }
+
+RUN printf 'load_module modules/ngx_http_limit_traffic_rate_filter_module.so;\nevents{}\nhttp{server{listen 9999;}}\n' \
+    > /tmp/probe.conf \
+    && /usr/local/nginx-dynamic/sbin/nginx -t -c /tmp/probe.conf \
+    || { echo "ERROR: nginx refused to load the dynamic module .so"; exit 1; }
+
+
+FROM nginx-static AS test-static
+
+WORKDIR /module
+COPY t/ ./t/
+RUN chmod +x t/load/*.sh
+
+ENV TEST_NGINX_BINARY=/usr/local/nginx-static/sbin/nginx
+ENV TEST_NGINX_PORT=18080
+ENV TEST_NGINX_MODULE_MODE=static
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["bash", "t/load/run_all.sh"]
+
+
+FROM nginx-dynamic AS test-dynamic
+
+WORKDIR /module
+COPY t/ ./t/
+RUN chmod +x t/load/*.sh
+
+ENV TEST_NGINX_BINARY=/usr/local/nginx-dynamic/sbin/nginx
+ENV TEST_NGINX_MODULES_PATH=/usr/local/nginx-dynamic/modules
+ENV TEST_NGINX_PORT=18080
+ENV TEST_NGINX_MODULE_MODE=dynamic
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["bash", "t/load/run_all.sh"]

@@ -1,0 +1,121 @@
+name: Load Tests
+
+on:
+  push:
+    branches: [main, master, dev]
+  pull_request:
+    branches: [main, master, dev]
+  workflow_dispatch:
+    inputs:
+      test_filter:
+        description: 'Run specific tests only (e.g. "01 06"). Leave empty for all.'
+        required: false
+        default: ''
+
+jobs:
+  load-test:
+    name: nginx ${{ matrix.nginx_version }} / ${{ matrix.module_mode }}
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        nginx_version: ["1.28.2", "1.29.6", "1.26.3"]
+        module_mode: ["static", "dynamic"]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set install prefix
+        run: |
+          echo "NGINX_PREFIX=$HOME/nginx-install/${{ matrix.nginx_version }}-${{ matrix.module_mode }}" \
+            >> "$GITHUB_ENV"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q \
+            build-essential  \
+            coreutils        \
+            libpcre2-dev     \
+            zlib1g-dev       \
+            libssl-dev       \
+            netcat-openbsd   \
+            curl             \
+            bc               \
+            procps           \
+            python3
+
+      - name: Cache nginx source
+        id: cache-nginx-src
+        uses: actions/cache@v5
+        with:
+          path: ~/nginx-src/nginx-${{ matrix.nginx_version }}
+          key: nginx-src-${{ matrix.nginx_version }}-v1
+
+      - name: Download nginx source
+        if: steps.cache-nginx-src.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/nginx-src
+          cd ~/nginx-src
+          wget -q "https://nginx.org/download/nginx-${{ matrix.nginx_version }}.tar.gz"
+          tar xzf "nginx-${{ matrix.nginx_version }}.tar.gz"
+          rm  "nginx-${{ matrix.nginx_version }}.tar.gz"
+
+      - name: Cache nginx binary
+        id: cache-nginx-bin
+        uses: actions/cache@v5
+        with:
+          path: ${{ env.NGINX_PREFIX }}
+          key: nginx-bin-${{ matrix.nginx_version }}-${{ matrix.module_mode }}-${{ hashFiles('*.c', 'config') }}-v1
+
+      - name: Build nginx with module
+        if: steps.cache-nginx-bin.outputs.cache-hit != 'true'
+        run: |
+          if [ "${{ matrix.module_mode }}" = "dynamic" ]; then
+            MODULE_FLAG="--add-dynamic-module=${{ github.workspace }}"
+          else
+            MODULE_FLAG="--add-module=${{ github.workspace }}"
+          fi
+
+          cd ~/nginx-src/nginx-${{ matrix.nginx_version }}
+          ./configure \
+            --with-debug \
+            $MODULE_FLAG \
+            --prefix="$NGINX_PREFIX" \
+            --with-http_stub_status_module
+
+          make -j"$(nproc)"
+          make install
+          "$NGINX_PREFIX/sbin/nginx" -v
+
+      - name: Make test scripts executable
+        run: chmod +x t/load/*.sh
+
+      - name: Run load tests
+        env:
+          TEST_NGINX_BINARY: ${{ env.NGINX_PREFIX }}/sbin/nginx
+          TEST_NGINX_MODULES_PATH: ${{ env.NGINX_PREFIX }}/modules
+          TEST_NGINX_MODULE_MODE: ${{ matrix.module_mode }}
+          TEST_NGINX_PORT: "18080"
+          NO_COLOR: "1"
+        run: |
+          FILTER="${{ github.event.inputs.test_filter || '' }}"
+          if [ -n "$FILTER" ]; then
+            bash t/load/run_all.sh $FILTER
+          else
+            bash t/load/run_all.sh
+          fi
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v6
+        with:
+          name: logs-nginx-${{ matrix.nginx_version }}-${{ matrix.module_mode }}
+          path: |
+            /tmp/ngx-*-*/logs/error.log
+            /tmp/ngx-*-*/logs/access.log
+            /tmp/ngx-*-*/flood_codes.txt
+          if-no-files-found: ignore
+          retention-days: 7
