@@ -1,5 +1,7 @@
 # ngx_http_limit_traffic_rate_filter_module
 
+![NGINX HTTP Limit Traffic Rate Filter Module Logo - ngx_http_limit_traffic_ratefilter_module](https://repository-images.githubusercontent.com/18655148/3960c9c3-cc0d-4e52-8e35-b1993eecc27d)
+
 Limits the **total** download bandwidth for all connections sharing the same
 key (e.g. `$remote_addr`), regardless of how many parallel connections the
 client opens.
