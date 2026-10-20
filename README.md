@@ -2,6 +2,11 @@
 
 ![NGINX HTTP Limit Traffic Rate Filter Module Logo - ngx_http_limit_traffic_ratefilter_module](https://repository-images.githubusercontent.com/18655148/3960c9c3-cc0d-4e52-8e35-b1993eecc27d)
 
+> **Next-generation project:** [ngx_traffic_governor](https://github.com/nginx-modules/ngx_traffic_governor)
+> is planned as a multi-protocol successor covering HTTP and non-HTTP traffic.
+> This repository remains the HTTP-only 2.x module; the new project is under
+> development and is not yet a drop-in replacement.
+
 Shares a configured download bandwidth among concurrent requests with the
 same key (e.g. `$remote_addr`), including connections handled by different
 nginx worker processes.
