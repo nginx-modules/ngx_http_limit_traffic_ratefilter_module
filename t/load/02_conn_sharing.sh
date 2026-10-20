@@ -21,7 +21,7 @@ source "$(dirname "$0")/helpers.sh"
 # 2. Parallel wall-clock time >= 4s (rate sharing confirmed)
 # 3. Aggregate throughput within ±35% of configured limit
 # 4. All downloaded files complete and byte-identical
-# 5. Post-parallel single download at full rate (<= 5s for 200KB at 120KB/s)
+# 5. Post-parallel single download returns close to full rate
 tap_plan 5
 
 trap _cleanup EXIT
@@ -128,10 +128,10 @@ curl -s --max-time 30 -o "${FRESH_OUT}/file1.bin" \
 fresh_elapsed=$(( ($(date +%s%N) - fresh_start + 999999999) / 1000000000 ))
 tap_diag "fresh single download: ${fresh_elapsed}s"
 
-# At 120KB/s, 200KB → ~1.7s expected. Allow up to 5s for CI jitter.
-# If stale conn=3, it would take ~5s — the boundary — so we use 6s as fail.
-if [ "$fresh_elapsed" -le 6 ]; then
-    tap_ok "post-parallel fresh download at full rate (${fresh_elapsed}s <= 6s)"
+# At 120KB/s, 200KB → ~1.7s expected. A stale conn=3 would take
+# around 5 seconds; a 6-second threshold would incorrectly accept it.
+if [ "$fresh_elapsed" -le 4 ]; then
+    tap_ok "post-parallel fresh download at full rate (${fresh_elapsed}s <= 4s)"
 else
     tap_fail "post-parallel conn cleanup" \
         "took ${fresh_elapsed}s — lir->conn may not have been decremented"

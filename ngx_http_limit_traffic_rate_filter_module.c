@@ -1,15 +1,11 @@
 /*
  * ngx_http_limit_traffic_rate_filter_module.c
  *
- * Limits the aggregate download rate for all connections that share the
- * same key (e.g. $remote_addr).  Each connection receives an equal slice:
- *
- *     per-connection rate = configured_limit / active_connections
- *
- * Unlike nginx's built-in limit_rate (which is per-connection), this
- * module tracks concurrent connections in shared memory so the total
- * throughput for one key stays at or below the configured ceiling even
- * when a client opens multiple parallel connections.
+ * Shares a configured download rate among active requests with the same
+ * key (e.g. $remote_addr).  Each request receives an approximate equal
+ * slice using the connection counter in shared memory.  Changes in that
+ * counter become visible to existing requests at subsequent filter calls;
+ * this is not a strict aggregate byte-budget limiter.
  */
 
 #include <ngx_config.h>
@@ -56,6 +52,7 @@ static char *ngx_http_limit_traffic_rate(
 typedef struct {
     ngx_shm_zone_t    *shm_zone;
     ngx_rbtree_node_t *node;
+    size_t             limit;
 } ngx_http_limit_traffic_rate_cleanup_t;
 
 /*
@@ -129,10 +126,20 @@ static ngx_http_output_body_filter_pt ngx_http_next_body_filter;
 
 /* -- shared rbtree lookup (internal, called with mutex held) --------------- */
 
+/* A zero rate disables nginx's limiter. Never round a share down to zero. */
+static size_t
+ngx_http_limit_traffic_rate_share(size_t limit, u_short conn)
+{
+    size_t rate;
+
+    rate = limit / conn;  /* caller holds the lock and checks conn != 0 */
+    return rate ? rate : 1;
+}
+
+
 /*
- * Finds the rbtree node for (hash, vv->data, vv->len) and returns a pointer
- * to its payload, or NULL if not found.
- * Caller must hold shpool->mutex.
+ * Finds the rbtree node for (hash, data, len) and returns a pointer
+ * to its payload, or NULL if not found. Caller must hold shpool->mutex.
  */
 static ngx_http_limit_traffic_rate_node_t *
 ngx_http_limit_traffic_rate_lookup(
@@ -243,8 +250,14 @@ ngx_http_limit_traffic_rate_filter_handler(ngx_http_request_t *r)
          * Other workers' requests will refresh their own r->limit_rate
          * the next time their body filter runs.
          */
+        if (lir->conn == (u_short) -1) {
+            ngx_shmtx_unlock(&shpool->mutex);
+            return NGX_HTTP_SERVICE_UNAVAILABLE;
+        }
+
         lir->conn++;
-        r->limit_rate = lircf->limit_traffic_rate / lir->conn;
+        r->limit_rate = ngx_http_limit_traffic_rate_share(
+                            lircf->limit_traffic_rate, lir->conn);
 
     } else {
         /*
@@ -282,6 +295,13 @@ ngx_http_limit_traffic_rate_filter_handler(ngx_http_request_t *r)
 
     lircln->shm_zone = lircf->shm_zone;
     lircln->node     = node;
+    lircln->limit    = lircf->limit_traffic_rate;
+
+    /* Mark our value as authoritative for the core write filter. */
+    r->limit_rate_set = 1;
+
+    /* Only registered requests may refresh their rate in the body filter. */
+    ngx_http_set_ctx(r, lircln, ngx_http_limit_traffic_rate_filter_module);
 
     return NGX_DECLINED;
 }
@@ -290,51 +310,33 @@ ngx_http_limit_traffic_rate_filter_handler(ngx_http_request_t *r)
 /* -- body filter: refresh r->limit_rate from the current conn count ------- */
 
 /*
- * Called on every write-event for this request.  Reads lir->conn from
- * shared memory (under the mutex) and updates r->limit_rate.
- *
- * This is the mechanism by which a connection learns about siblings joining
- * or leaving: the counter changes in shared memory, and each worker picks
- * it up the next time its write-event fires — typically within 100-200 ms.
- * No cross-process pointer dereference is needed or performed.
+ * Refresh only requests registered in PREACCESS.  The request-pool cleanup
+ * record is our per-request context and keeps the shared node allocated
+ * until request teardown; dereference the node only under its slab mutex.
+ * Recalculation happens on body-filter invocation, not synchronously on
+ * every counter change in another worker.
  */
 static ngx_int_t
 ngx_http_limit_traffic_rate_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 {
-    /* C89: all declarations before statements. */
-    size_t                               len;
-    uint32_t                             hash;
-    ngx_slab_pool_t                     *shpool;
-    ngx_http_variable_value_t           *vv;
-    ngx_http_limit_traffic_rate_ctx_t   *ctx;
-    ngx_http_limit_traffic_rate_node_t  *lir;
-    ngx_http_limit_traffic_rate_conf_t  *lircf;
+    ngx_slab_pool_t                        *shpool;
+    ngx_http_limit_traffic_rate_node_t     *lir;
+    ngx_http_limit_traffic_rate_cleanup_t  *lircln;
 
-    lircf = ngx_http_get_module_loc_conf(r,
-                ngx_http_limit_traffic_rate_filter_module);
-
-    if (lircf->shm_zone == NULL) {
+    lircln = ngx_http_get_module_ctx(r,
+                 ngx_http_limit_traffic_rate_filter_module);
+    if (lircln == NULL) {
         return ngx_http_next_body_filter(r, in);
     }
 
-    ctx = lircf->shm_zone->data;
-    vv  = ngx_http_get_indexed_variable(r, ctx->index);
-
-    if (vv == NULL || vv->not_found || vv->len == 0 || vv->len > 1024) {
-        return ngx_http_next_body_filter(r, in);
-    }
-
-    len  = vv->len;
-    hash = ngx_crc32_short(vv->data, len);
-
-    shpool = (ngx_slab_pool_t *) lircf->shm_zone->shm.addr;
-
+    shpool = (ngx_slab_pool_t *) lircln->shm_zone->shm.addr;
     ngx_shmtx_lock(&shpool->mutex);
 
-    lir = ngx_http_limit_traffic_rate_lookup(ctx, hash, vv->data, len, NULL);
-
-    if (lir != NULL && lir->conn > 0) {
-        r->limit_rate = lircf->limit_traffic_rate / lir->conn;
+    lir = (ngx_http_limit_traffic_rate_node_t *) &lircln->node->color;
+    if (lir->conn != 0) {
+        r->limit_rate = ngx_http_limit_traffic_rate_share(
+                            lircln->limit, lir->conn);
+        r->limit_rate_set = 1;
     }
 
     ngx_shmtx_unlock(&shpool->mutex);
@@ -564,7 +566,7 @@ ngx_http_limit_traffic_rate_zone(ngx_conf_t *cf, ngx_command_t *cmd,
 
     value = cf->args->elts;
 
-    if (value[2].data[0] != '$') {
+    if (value[2].len < 2 || value[2].data[0] != '$') {
         ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
                            "invalid variable name \"%V\"", &value[2]);
         return NGX_CONF_ERROR;

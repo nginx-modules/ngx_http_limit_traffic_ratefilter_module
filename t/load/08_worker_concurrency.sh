@@ -20,20 +20,17 @@
 #       same rbtree node (same client IP, different connections)
 #
 # DETECTION STRATEGY:
-#   We run 200 concurrent curl requests. With 4 workers, each handles ~50.
+#   We run 80 concurrent curl requests. With 4 workers, each handles ~20.
 #   All requests come from 127.0.0.1 so they all contend on the same
 #   rbtree node. We assert:
-#     a. No HTTP 500 responses (would indicate a crash in a worker)
-#     b. No SIGSEGV/abort in the error log (worker crash from memory corruption)
-#     c. nginx master still alive after the load (no cascading crash)
-#     d. All 200 requests return 200 or 503 (503 is acceptable if zone fills,
-#        but 500 is not — it means the module returned an error code it should
-#        not have, or nginx caught a crash in the worker)
+#     a. All HTTP responses are 200 and complete before the timeout
+#     b. No SIGSEGV/abort in the error log
+#     c. nginx master and workers remain alive after the load
 
 source "$(dirname "$0")/helpers.sh"
 
-# 1. nginx starts with 4 workers
-# 2. 200 concurrent requests: zero HTTP 500 responses
+# 1. nginx starts with exactly 4 workers
+# 2. All 80 requests complete with HTTP 200 (no 503/timeout)
 # 3. No worker crash signals in error log
 # 4. nginx master alive after concurrent load
 # 5. Rate limiting still functional after concurrent load
@@ -43,8 +40,8 @@ trap _cleanup EXIT
 check_requirements
 
 RATE_DIRECTIVE="200k"
-FILE_BYTES=65536       # 64 KB — small enough for fast concurrent transfers
-CONCURRENCY=200
+FILE_BYTES=16384       # 16 KiB * 80 => ~6.4s at 200 KiB/s
+CONCURRENCY=80
 RATE_BYTES=204800      # 200 KB/s
 
 init_test_dir "worker-concurrency"
@@ -82,14 +79,11 @@ start_nginx
 # Verify we actually have 4 workers.
 worker_count=$(get_worker_pids | wc -l)
 tap_diag "worker count: $worker_count"
-if [ "$worker_count" -ne 4 ]; then
-    tap_diag "WARNING: expected 4 workers, got $worker_count"
+if [ "$worker_count" -eq 4 ]; then
+    tap_ok "nginx starts with exactly four workers"
+else
+    tap_fail "four-worker startup" "expected 4, got $worker_count"
 fi
-
-# Test 1 — startup
-assert_http_status \
-    "http://127.0.0.1:${TEST_PORT}/files/concurrent.bin" "200" \
-    "nginx starts with 4 workers"
 
 # Launch CONCURRENCY parallel curl requests.
 tap_diag "launching $CONCURRENCY concurrent requests across 4 workers..."
@@ -99,13 +93,16 @@ t_start=$(date +%s%N)
 
 for i in $(seq 1 "$CONCURRENCY"); do
     curl -s -o /dev/null -w '%{http_code}\n' \
-        --max-time 30 \
+        --max-time 45 \
         "http://127.0.0.1:${TEST_PORT}/files/concurrent.bin" \
         >> "$CODES_FILE" 2>/dev/null &
     pids+=($!)
 done
 
-for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+curl_errors=0
+for pid in "${pids[@]}"; do
+    wait "$pid" 2>/dev/null || curl_errors=$((curl_errors + 1))
+done
 elapsed=$(( ($(date +%s%N) - t_start + 999999999) / 1000000000 ))
 
 count_200=$(grep -c '^200$' "$CODES_FILE" 2>/dev/null || true); count_200="${count_200:-0}"
@@ -114,12 +111,12 @@ count_503=$(grep -c '^503$' "$CODES_FILE" 2>/dev/null || true); count_503="${cou
 count_000=$(grep -c '^000$' "$CODES_FILE" 2>/dev/null || true); count_000="${count_000:-0}"
 tap_diag "results: 200=${count_200} 500=${count_500} 503=${count_503} timeout=${count_000} elapsed=${elapsed}s"
 
-# Test 2 — zero 500s (500 indicates a module crash or internal error)
-if [ "$count_500" -eq 0 ]; then
-    tap_ok "zero HTTP 500 responses across $CONCURRENCY concurrent requests"
+# Test 2 — no false passes when every request timed out or failed.
+if [ "$count_200" -eq "$CONCURRENCY" ] && [ "$curl_errors" -eq 0 ]; then
+    tap_ok "all $CONCURRENCY concurrent requests returned HTTP 200"
 else
-    tap_fail "no 500 responses" \
-        "$count_500 HTTP 500s — worker may have crashed or module returned internal error"
+    tap_fail "complete concurrent responses" \
+        "200=$count_200/""$CONCURRENCY"" 500=$count_500 503=$count_503 000=$count_000 curl_errors=$curl_errors"
 fi
 
 # Test 3 — no crash signals in log
@@ -135,9 +132,7 @@ fi
 
 # Test 5 — rate limiting still works after the concurrent storm
 # A fresh single download should still be rate-limited.
-# 64 KB at 200 KB/s = 0.3s unconstrained; with rate limit ~0.3s too since
-# it's a small file. We verify the zone is healthy by checking HTTP 200
-# and that the file is served completely.
+# Verify zone health and file integrity after the concurrency storm.
 FRESH_OUT="$TEST_DIR/downloads/post.bin"
 mkdir -p "$TEST_DIR/downloads"
 sleep 1

@@ -1,32 +1,12 @@
 #!/usr/bin/env bash
 # t/load/03_memory_leak.sh
 #
-# Prove that the slab allocator's memory usage is bounded under sustained load.
+# Regression checks for memory growth and successful cleanup under 5,000
+# requests. The current implementation allocates one shared tree node per
+# active key and frees it when the last request finishes; it no longer has
+# per-request queue entries in the shared slab. Worker RSS is only a coarse
+# signal and must not be presented as proof of leak freedom.
 #
-# WHY THE ORIGINAL TEST WAS TOO SHALLOW:
-#   500 requests against a 4 KB file at 500 KB/s completes in ~4 seconds.
-#   Linux kernel RSS granularity is 4 KB per page. A leak of 48 bytes per
-#   request (one unfree'd queue entry) across 500 requests = 24 KB total,
-#   which rounds to 8 kernel pages — invisible against RSS noise of 100+ KB
-#   from nginx's own allocations. You need enough requests that a per-request
-#   leak accumulates into multiple megabytes to be unambiguously detectable.
-#
-# THIS TEST RUNS TWO DETECTION STRATEGIES IN PARALLEL:
-#
-# Strategy A — RSS growth (what the original test did, but with 5000 requests):
-#   5000 requests × 48 bytes/leak = 240 KB minimum detectable leak.
-#   We allow 512 KB growth to absorb nginx buffer pool rounding.
-#   A real unfixed leak (the inverted if(!tr->r) bug) would show ~3 MB growth.
-#
-# Strategy B — HTTP 503 rate (direct slab exhaustion detector):
-#   Each unique IP creates one persistent rbtree node that is NEVER freed
-#   (127.0.0.1 → one node, stays alive). But per-request queue entries ARE
-#   freed on every request. If they leak, the 2 MB zone fills up after
-#   roughly 2MB / 48 bytes ≈ 43,000 leaked entries. We use a 2 MB zone and
-#   watch for the first 503, which would appear long before 5000 requests
-#   if leaking (after ~43 requests with no free). Zero 503s in 5000 requests
-#   is strong evidence of correct cleanup.
-
 source "$(dirname "$0")/helpers.sh"
 
 # 1. nginx starts and serves requests
@@ -41,11 +21,11 @@ check_requirements
 
 WARMUP_REQUESTS=500
 STRESS_REQUESTS=4500
-FILE_BYTES=65536       # 64 KB — large enough to exercise the rate path on
-                       # each request, small enough to keep total time under
-                       # 60s at 500 KB/s (64KB / 500KB/s × 5000 = 640s if
-                       # sequential — we use parallel batches below)
-RATE="500k"
+FILE_BYTES=65536       # 64 KiB * 5,000 requests ~= 312.5 MiB in total.
+                       # This is a cleanup test, not a throughput benchmark.
+                       # Use a high per-key rate so it finishes within CI's
+                       # 300-second per-test deadline after rate enforcement.
+RATE="32m"
 MAX_RSS_GROWTH_KB=512
 
 init_test_dir "memory-leak"
@@ -130,7 +110,7 @@ if [ "$total_errors" -eq 0 ]; then
     tap_ok "zero non-200 across all $(( WARMUP_REQUESTS + STRESS_REQUESTS )) requests"
 else
     tap_fail "no slab exhaustion" \
-        "$total_errors non-200 responses — queue entries may be leaking"
+        "$total_errors non-200 responses — possible memory or request failure"
 fi
 
 # Test 5 — zone still healthy

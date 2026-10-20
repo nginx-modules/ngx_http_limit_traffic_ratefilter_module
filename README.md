@@ -2,27 +2,30 @@
 
 ![NGINX HTTP Limit Traffic Rate Filter Module Logo - ngx_http_limit_traffic_ratefilter_module](https://repository-images.githubusercontent.com/18655148/3960c9c3-cc0d-4e52-8e35-b1993eecc27d)
 
-Limits the **total** download bandwidth for all connections sharing the same
-key (e.g. `$remote_addr`), regardless of how many parallel connections the
-client opens.
+Shares a configured download bandwidth among concurrent requests with the
+same key (e.g. `$remote_addr`), including connections handled by different
+nginx worker processes.
 
 nginx's built-in `limit_rate` caps each connection individually. A client
 using a multi-threaded download tool can open *N* connections and receive
 *N × limit_rate* in aggregate. This module tracks all active connections for
-a given key in a shared memory zone and assigns each one an equal slice:
+a given key in a shared-memory zone and calculates an approximate fair share:
 
 ```
-per-connection rate = configured_limit / active_connections
+per-request rate = max(1 byte/s, configured_limit / active_requests)
 ```
 
-The rate is recalculated and pushed to all sibling connections whenever one
-joins or leaves, so the aggregate throughput stays at or below the configured
-ceiling at all times.
+Each request refreshes its own rate on subsequent output body-filter calls.
+**Rates are not pushed immediately to sibling requests across workers.**
+In particular, the sum of actual throughput is not a strict instantaneous
+ceiling while membership changes. For a hard aggregate byte budget across
+workers, a different scheduling design is needed (a candidate for v3.0.0).
 
 ## Requirements
 
-- nginx 1.21.5 or later
-- GCC 4+ or Clang 3+ (C89-compatible)
+- nginx 1.21.5 or later (documented minimum; CI currently builds 1.26.3,
+  1.28.2 and 1.29.6, not the minimum)
+- A C compiler supported by your nginx build (code uses C89-style declarations)
 
 ## Installation
 
@@ -90,8 +93,8 @@ http {
     limit_traffic_rate_zone  rate  $remote_addr  32m;
 
     server {
-        # Total bandwidth per IP capped at 500 KB/s.
-        # A client with 8 parallel connections gets 62.5 KB/s each.
+        # Target aggregate bandwidth per IP: 500 KiB/s.
+        # With 8 steady requests, each gets about 62.5 KiB/s.
         location /download/ {
             limit_traffic_rate  rate  500k;
         }
@@ -101,17 +104,54 @@ http {
 
 ## Behaviour
 
-**Rate sharing.** When a new connection from the same key arrives the module
-increments the connection counter and immediately lowers `r->limit_rate` on
-all existing sibling connections. When a connection closes the counter is
-decremented and surviving siblings are raised back up.
+**Rate sharing.** A shared counter tracks active requests for each key.
+Joining requests receive their own share immediately. Existing requests learn
+of additions/removals when their output body filter runs again. The module
+sets `r->limit_rate_set` so the nginx write filter respects its chosen rate.
+The module's `limit_traffic_rate` takes precedence over the native nginx
+`limit_rate` in matching locations; the core `limit_rate_after` still applies.
 
-**Graceful degradation.** If the shared memory zone is exhausted the module
-returns HTTP 503 rather than crashing or silently disabling limiting.
+**Approximation, not a strict aggregate cap.** Refresh timing depends on nginx
+output scheduling and buffering; it is not synchronous across workers. The
+integer division is floored at 1 byte/s because zero disables nginx rate
+limiting. When the number of active requests exceeds the configured limit
+in bytes/s, the combined floor may exceed that limit. The core rate limiter
+can also permit initial bursts. This release does not implement cross-worker
+token-bucket accounting or provide a hard aggregate throughput guarantee.
+
+**Admission and overload.** The shared counter is a `u_short`: once a key has
+65,535 active registered requests, additional requests for that key receive
+HTTP 503 instead of wrapping the counter. An exhausted shared-memory slab
+also produces HTTP 503. No durable worker-crash recovery is implemented:
+if a worker is killed without request cleanup, a stale count can persist until
+the shared zone is recreated. Normal request completion and client aborts
+perform cleanup via the request pool.
 
 **Passthrough.** The module does not apply a limit when no `limit_traffic_rate`
 directive is present, the key variable is empty or not found, or the key
 value exceeds 1024 bytes.
+
+## Validation
+
+The load tests under `t/load/` run with either a statically compiled module
+or a dynamically loaded `.so`. CI configures nginx versions `1.26.3`,
+`1.28.2` and `1.29.6` in both modes. The test suite includes multi-worker
+throughput, nginx `limit_rate` precedence, invalid configuration, request
+cleanup, graceful reload, concurrent shared-zone exhaustion and a
+5,000-request repeated-allocation test.
+
+```bash
+# After building nginx with the module, using your actual binary:
+TEST_NGINX_BINARY=/path/to/nginx/sbin/nginx bash t/load/run_all.sh
+
+# Run only the multi-worker bandwidth and write-filter regressions:
+TEST_NGINX_BINARY=/path/to/nginx/sbin/nginx \
+    bash t/load/run_all.sh 11 12
+```
+
+The tests cover selected workloads; they do not establish strict aggregate
+bandwidth guarantees, failure recovery after `SIGKILL`, or compatibility with
+every nginx build and output-filter combination.
 
 ## License
 

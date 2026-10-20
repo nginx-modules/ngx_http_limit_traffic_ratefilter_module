@@ -81,7 +81,7 @@ write_nginx_conf() {
 
     cat > "$NGINX_CONF" <<NGINXCONF
 ${preamble}
-worker_processes 1;
+worker_processes ${TEST_NGINX_WORKERS:-1};
 pid $TEST_DIR/nginx.pid;
 error_log $TEST_DIR/logs/error.log debug;
 

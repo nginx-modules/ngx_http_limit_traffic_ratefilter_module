@@ -4,21 +4,9 @@
 # Verify that the cleanup handler fires correctly when a client aborts
 # mid-download (connection reset without completing the transfer).
 #
-# WHY THIS IS THE MOST IMPORTANT EDGE CASE:
-#   The module has two paths for removing a request from the per-IP queue:
-#
-#   Normal path:  log phase handler removes the queue entry, then the pool
-#                 cleanup handler decrements lir->conn.
-#
-#   Abort path:   log phase is skipped. Only the pool cleanup handler fires,
-#                 which must act as the safety net: find the queue entry,
-#                 free it, AND decrement lir->conn.
-#
-#   The original c0c90f5 patch broke this with:
-#       if (!tr->r) { ngx_slab_free_locked(shpool, tr); }
-#   The condition is inverted — it only frees entries already cleaned by
-#   the log phase (tr->r == NULL), never entries from aborted connections
-#   (tr->r != NULL). The rewrite corrected this. This test verifies it.
+# The request-pool cleanup handler must decrement the shared active-request
+# counter after client aborts, even if the response never finishes. No
+# per-request queue or log-phase cleanup exists since v2.0.0.
 #
 # HOW WE SIMULATE AN ABORT:
 #   curl --max-time <N> with N small enough that the download is still in
